@@ -23,6 +23,7 @@ import (
 	"bytes"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -39,6 +40,9 @@ type Message struct {
 	IsFromMe  bool
 	MediaType string
 	Filename  string
+	Starred   bool
+	ChatJID   string // Which chat/group this message belongs to
+	ChatName  string // Name of the chat/group for context
 }
 
 // Database handler for storing message history
@@ -90,6 +94,13 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
+	// Run database migrations
+	migrationManager := NewMigrationManager(db)
+	if err := migrationManager.RunMigrations(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to run migrations: %v", err)
+	}
+
 	return &MessageStore{db: db}, nil
 }
 
@@ -109,7 +120,7 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
-	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64, starred bool) error {
 	// Only store if there's actual content or media
 	if content == "" && mediaType == "" {
 		return nil
@@ -117,9 +128,9 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 
 	_, err := store.db.Exec(
 		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, starred) 
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, starred,
 	)
 	return err
 }
@@ -127,7 +138,7 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 // Get messages from a chat
 func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, error) {
 	rows, err := store.db.Query(
-		"SELECT sender, content, timestamp, is_from_me, media_type, filename FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?",
+		"SELECT sender, content, timestamp, is_from_me, media_type, filename, COALESCE(starred, false) FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?",
 		chatJID, limit,
 	)
 	if err != nil {
@@ -139,7 +150,7 @@ func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, er
 	for rows.Next() {
 		var msg Message
 		var timestamp time.Time
-		err := rows.Scan(&msg.Sender, &msg.Content, &timestamp, &msg.IsFromMe, &msg.MediaType, &msg.Filename)
+		err := rows.Scan(&msg.Sender, &msg.Content, &timestamp, &msg.IsFromMe, &msg.MediaType, &msg.Filename, &msg.Starred)
 		if err != nil {
 			return nil, err
 		}
@@ -449,6 +460,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fileSHA256,
 		fileEncSHA256,
 		fileLength,
+		false, // starred - default to false for new messages
 	)
 
 	if err != nil {
@@ -470,6 +482,31 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	}
 }
 
+// Handle starred message events from WhatsApp
+func handleStarEvent(client *whatsmeow.Client, messageStore *MessageStore, evt *events.Star, logger waLog.Logger) {
+	logger.Infof("Star event: message %s in chat %s, starred: %t", 
+		evt.MessageID, evt.ChatJID.String(), evt.Action.GetStarred())
+	
+	// Update message starred status in database
+	err := messageStore.UpdateMessageStarredStatus(evt.MessageID, evt.ChatJID.String(), evt.Action.GetStarred())
+	if err != nil {
+		logger.Warnf("Failed to update starred status: %v", err)
+	} else {
+		action := "starred"
+		if !evt.Action.GetStarred() {
+			action = "unstarred"
+		}
+		logger.Infof("Message %s %s successfully", evt.MessageID, action)
+	}
+}
+
+// Send star/unstar action to WhatsApp
+func sendStarAction(client *whatsmeow.Client, chatJID, senderJID types.JID, messageID string, isFromMe, starred bool) error {
+	// Build the star patch using whatsmeow's appstate package
+	patch := appstate.BuildStar(chatJID, senderJID, types.MessageID(messageID), isFromMe, starred)
+	return client.SendAppState(context.Background(), patch)
+}
+
 // DownloadMediaRequest represents the request body for the download media API
 type DownloadMediaRequest struct {
 	MessageID string `json:"message_id"`
@@ -482,6 +519,27 @@ type DownloadMediaResponse struct {
 	Message  string `json:"message"`
 	Filename string `json:"filename,omitempty"`
 	Path     string `json:"path,omitempty"`
+}
+
+// StarMessageRequest represents the request body for star/unstar message API
+type StarMessageRequest struct {
+	MessageID string `json:"message_id"`
+	ChatJID   string `json:"chat_jid"`
+	Starred   bool   `json:"starred"`
+}
+
+// StarMessageResponse represents the response for the star message API
+type StarMessageResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+}
+
+// GetStarredMessagesResponse represents the response for getting starred messages
+type GetStarredMessagesResponse struct {
+	Success  bool      `json:"success"`
+	Message  string    `json:"message"`
+	Messages []Message `json:"messages,omitempty"`
+	Count    int       `json:"count,omitempty"`
 }
 
 // Store additional media info in the database
@@ -505,6 +563,64 @@ func (store *MessageStore) GetMediaInfo(id, chatJID string) (string, string, str
 	).Scan(&mediaType, &filename, &url, &mediaKey, &fileSHA256, &fileEncSHA256, &fileLength)
 
 	return mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, err
+}
+
+// UpdateMessageStarredStatus updates the starred status of a message
+func (store *MessageStore) UpdateMessageStarredStatus(id, chatJID string, starred bool) error {
+	_, err := store.db.Exec(
+		"UPDATE messages SET starred = ? WHERE id = ? AND chat_jid = ?",
+		starred, id, chatJID,
+	)
+	return err
+}
+
+// GetStarredMessages returns ALL starred messages across all chats with pagination
+func (store *MessageStore) GetStarredMessages(limit, offset int) ([]Message, error) {
+	query := `SELECT m.sender, m.content, m.timestamp, m.is_from_me, m.media_type, m.filename, m.starred, m.chat_jid, c.name as chat_name
+			FROM messages m
+			LEFT JOIN chats c ON m.chat_jid = c.jid
+			WHERE m.starred = true 
+			ORDER BY m.timestamp DESC 
+			LIMIT ? OFFSET ?`
+	
+	rows, err := store.db.Query(query, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var messages []Message
+	for rows.Next() {
+		var msg Message
+		var timestamp time.Time
+		var chatJID, chatName sql.NullString
+		
+		err := rows.Scan(&msg.Sender, &msg.Content, &timestamp, &msg.IsFromMe, 
+			&msg.MediaType, &msg.Filename, &msg.Starred, &chatJID, &chatName)
+		if err != nil {
+			return nil, err
+		}
+		
+		msg.Time = timestamp
+		// Store chat info in the message for context
+		if chatJID.Valid {
+			msg.ChatJID = chatJID.String
+		}
+		if chatName.Valid {
+			msg.ChatName = chatName.String
+		}
+		
+		messages = append(messages, msg)
+	}
+
+	return messages, nil
+}
+
+// GetStarredMessageCount returns the total count of starred messages across all chats
+func (store *MessageStore) GetStarredMessageCount() (int, error) {
+	var count int
+	err := store.db.QueryRow("SELECT COUNT(*) FROM messages WHERE starred = true").Scan(&count)
+	return count, err
 }
 
 // MediaDownloader implements the whatsmeow.DownloadableMessage interface
@@ -774,6 +890,123 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for starring/unstarring messages
+	http.HandleFunc("/api/star", func(w http.ResponseWriter, r *http.Request) {
+		// Only allow POST requests
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Parse the request body
+		var req StarMessageRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		// Validate request
+		if req.MessageID == "" || req.ChatJID == "" {
+			http.Error(w, "Message ID and Chat JID are required", http.StatusBadRequest)
+			return
+		}
+
+		// Parse JIDs
+		chatJID, err := types.ParseJID(req.ChatJID)
+		if err != nil {
+			http.Error(w, "Invalid chat JID", http.StatusBadRequest)
+			return
+		}
+
+		// For now, we'll assume the sender is the same as chat for 1-on-1 messages
+		// For group messages, this might need more logic to determine the actual sender
+		senderJID := chatJID
+		isFromMe := false // This should be determined from the original message
+
+		// Send star action to WhatsApp
+		err = sendStarAction(client, chatJID, senderJID, req.MessageID, isFromMe, req.Starred)
+
+		// Set response headers
+		w.Header().Set("Content-Type", "application/json")
+
+		// Handle result
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(StarMessageResponse{
+				Success: false,
+				Message: fmt.Sprintf("Failed to update star status: %s", err.Error()),
+			})
+			return
+		}
+
+		// Send successful response
+		action := "starred"
+		if !req.Starred {
+			action = "unstarred"
+		}
+		json.NewEncoder(w).Encode(StarMessageResponse{
+			Success: true,
+			Message: fmt.Sprintf("Message %s successfully", action),
+		})
+	})
+
+	// Handler for getting starred messages
+	http.HandleFunc("/api/starred", func(w http.ResponseWriter, r *http.Request) {
+		// Only allow GET requests
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Parse query parameters
+		limitStr := r.URL.Query().Get("limit")
+		offsetStr := r.URL.Query().Get("offset")
+
+		limit := 20 // default
+		offset := 0 // default
+
+		if limitStr != "" {
+			if parsedLimit, err := strconv.Atoi(limitStr); err == nil && parsedLimit > 0 {
+				limit = parsedLimit
+			}
+		}
+
+		if offsetStr != "" {
+			if parsedOffset, err := strconv.Atoi(offsetStr); err == nil && parsedOffset >= 0 {
+				offset = parsedOffset
+			}
+		}
+
+		// Get starred messages
+		messages, err := messageStore.GetStarredMessages(limit, offset)
+
+		// Set response headers
+		w.Header().Set("Content-Type", "application/json")
+
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(GetStarredMessagesResponse{
+				Success: false,
+				Message: fmt.Sprintf("Failed to get starred messages: %s", err.Error()),
+			})
+			return
+		}
+
+		// Get total count
+		count, err := messageStore.GetStarredMessageCount()
+		if err != nil {
+			count = 0 // fallback
+		}
+
+		// Send successful response
+		json.NewEncoder(w).Encode(GetStarredMessagesResponse{
+			Success:  true,
+			Message:  fmt.Sprintf("Retrieved %d starred messages", len(messages)),
+			Messages: messages,
+			Count:    count,
+		})
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -850,6 +1083,10 @@ func main() {
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
+			
+		case *events.Star:
+			// Process star/unstar events
+			handleStarEvent(client, messageStore, v, logger)
 		}
 	})
 
@@ -1126,6 +1363,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					fileSHA256,
 					fileEncSHA256,
 					fileLength,
+					false, // starred - default to false for history sync messages
 				)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)

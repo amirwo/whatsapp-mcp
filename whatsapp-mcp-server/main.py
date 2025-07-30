@@ -12,7 +12,11 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    star_message as whatsapp_star_message,
+    unstar_message as whatsapp_unstar_message,
+    list_starred_messages as whatsapp_list_starred_messages,
+    get_starred_message_count as whatsapp_get_starred_message_count
 )
 
 # Initialize FastMCP server
@@ -245,6 +249,67 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool()
+def star_message(message_id: str, chat_jid: str) -> Dict[str, Any]:
+    """Star a WhatsApp message to save it for later reference.
+    
+    Args:
+        message_id: The ID of the message to star
+        chat_jid: The JID of the chat containing the message
+    
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    success, status_message = whatsapp_star_message(message_id, chat_jid, starred=True)
+    return {
+        "success": success,
+        "message": status_message
+    }
+
+@mcp.tool()
+def unstar_message(message_id: str, chat_jid: str) -> Dict[str, Any]:
+    """Unstar a WhatsApp message to remove it from starred messages.
+    
+    Args:
+        message_id: The ID of the message to unstar
+        chat_jid: The JID of the chat containing the message
+    
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    success, status_message = whatsapp_unstar_message(message_id, chat_jid)
+    return {
+        "success": success,
+        "message": status_message
+    }
+
+@mcp.tool()
+def list_starred_messages(limit: int = 20, page: int = 0) -> str:
+    """Get all starred WhatsApp messages across all chats with pagination.
+    This shows starred messages from ALL chats and groups, providing context about which chat each message came from.
+    
+    Args:
+        limit: Maximum number of messages to return per page (default 20)
+        page: Page number for pagination, starting from 0 (default 0)
+    
+    Returns:
+        A formatted string showing starred messages with chat context and timestamps
+    """
+    return whatsapp_list_starred_messages(limit=limit, page=page)
+
+@mcp.tool()
+def get_starred_message_count() -> Dict[str, Any]:
+    """Get the total count of starred WhatsApp messages across all chats.
+    
+    Returns:
+        A dictionary containing the count of starred messages
+    """
+    count = whatsapp_get_starred_message_count()
+    return {
+        "starred_message_count": count,
+        "message": f"You have {count} starred messages across all your chats"
+    }
 
 if __name__ == "__main__":
     # Initialize and run the server

@@ -20,6 +20,7 @@ class Message:
     id: str
     chat_name: Optional[str] = None
     media_type: Optional[str] = None
+    starred: bool = False
 
 @dataclass
 class Chat:
@@ -139,7 +140,7 @@ def list_messages(
         cursor = conn.cursor()
         
         # Build base query
-        query_parts = ["SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type FROM messages"]
+        query_parts = ["SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, COALESCE(messages.starred, 0) FROM messages"]
         query_parts.append("JOIN chats ON messages.chat_jid = chats.jid")
         where_clauses = []
         params = []
@@ -197,7 +198,8 @@ def list_messages(
                 is_from_me=msg[4],
                 chat_jid=msg[5],
                 id=msg[6],
-                media_type=msg[7]
+                media_type=msg[7],
+                starred=bool(msg[8])
             )
             result.append(message)
             
@@ -235,7 +237,7 @@ def get_message_context(
         
         # Get the target message first
         cursor.execute("""
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type
+            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type, COALESCE(messages.starred, 0)
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
             WHERE messages.id = ?
@@ -253,12 +255,13 @@ def get_message_context(
             is_from_me=msg_data[4],
             chat_jid=msg_data[5],
             id=msg_data[6],
-            media_type=msg_data[8]
+            media_type=msg_data[8],
+            starred=bool(msg_data[9])
         )
         
         # Get messages before
         cursor.execute("""
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type
+            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, COALESCE(messages.starred, 0)
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
             WHERE messages.chat_jid = ? AND messages.timestamp < ?
@@ -276,12 +279,13 @@ def get_message_context(
                 is_from_me=msg[4],
                 chat_jid=msg[5],
                 id=msg[6],
-                media_type=msg[7]
+                media_type=msg[7],
+                starred=bool(msg[8])
             ))
         
         # Get messages after
         cursor.execute("""
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type
+            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, COALESCE(messages.starred, 0)
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
             WHERE messages.chat_jid = ? AND messages.timestamp > ?
@@ -299,7 +303,8 @@ def get_message_context(
                 is_from_me=msg[4],
                 chat_jid=msg[5],
                 id=msg[6],
-                media_type=msg[7]
+                media_type=msg[7],
+                starred=bool(msg[8])
             ))
         
         return MessageContext(
@@ -765,3 +770,109 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None
+
+def star_message(message_id: str, chat_jid: str, starred: bool = True) -> Tuple[bool, str]:
+    """Star or unstar a message"""
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/star"
+        payload = {
+            "message_id": message_id,
+            "chat_jid": chat_jid,
+            "starred": starred
+        }
+        
+        response = requests.post(url, json=payload)
+        
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("success", False), result.get("message", "Unknown response")
+        else:
+            return False, f"Error: HTTP {response.status_code} - {response.text}"
+            
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+def unstar_message(message_id: str, chat_jid: str) -> Tuple[bool, str]:
+    """Unstar a message (convenience function)"""
+    return star_message(message_id, chat_jid, starred=False)
+
+def list_starred_messages(limit: int = 20, page: int = 0) -> str:
+    """Get ALL starred messages across all chats with pagination"""
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/starred"
+        params = {
+            "limit": limit,
+            "offset": page * limit
+        }
+        
+        response = requests.get(url, params=params)
+        
+        if response.status_code == 200:
+            result = response.json()
+            if result.get("success", False):
+                messages = result.get("messages", [])
+                count = result.get("count", 0)
+                
+                if not messages:
+                    return f"No starred messages found. Total starred messages: {count}"
+                
+                # Format messages for display
+                output = f"=== Starred Messages (Page {page + 1}) ===\n"
+                output += f"Total starred messages: {count}\n"
+                output += f"Showing {len(messages)} messages\n\n"
+                
+                for msg_data in messages:
+                    # Convert the dict data back to Message object for formatting
+                    message = Message(
+                        timestamp=datetime.fromisoformat(msg_data['Time'].replace('Z', '+00:00')),
+                        sender=msg_data['Sender'],
+                        content=msg_data['Content'],
+                        is_from_me=msg_data['IsFromMe'],
+                        chat_jid=msg_data['ChatJID'],
+                        id='',  # Not needed for display
+                        chat_name=msg_data.get('ChatName', 'Unknown Chat'),
+                        media_type=msg_data.get('MediaType'),
+                        starred=msg_data.get('Starred', True)
+                    )
+                    
+                    # Format with chat context
+                    chat_indicator = f"[{message.chat_name}]" if message.chat_name else f"[{message.chat_jid}]"
+                    sender_name = "Me" if message.is_from_me else message.sender
+                    media_info = f" [{message.media_type}]" if message.media_type else ""
+                    
+                    output += f"⭐ {chat_indicator} {sender_name}: {message.content}{media_info}\n"
+                    output += f"   {message.timestamp.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                
+                return output
+            else:
+                return f"Failed to get starred messages: {result.get('message', 'Unknown error')}"
+        else:
+            return f"Error: HTTP {response.status_code} - {response.text}"
+            
+    except requests.RequestException as e:
+        return f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return f"Error parsing response: {response.text}"
+    except Exception as e:
+        return f"Unexpected error: {str(e)}"
+
+def get_starred_message_count() -> int:
+    """Get count of starred messages across all chats"""
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/starred"
+        params = {"limit": 1, "offset": 0}  # Just get count, minimal data
+        
+        response = requests.get(url, params=params)
+        
+        if response.status_code == 200:
+            result = response.json()
+            if result.get("success", False):
+                return result.get("count", 0)
+        return 0
+        
+    except Exception:
+        return 0
