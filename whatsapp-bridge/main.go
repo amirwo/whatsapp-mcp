@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -484,9 +485,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 // Handle starred message events from WhatsApp
 func handleStarEvent(client *whatsmeow.Client, messageStore *MessageStore, evt *events.Star, logger waLog.Logger) {
-	logger.Infof("Star event: message %s in chat %s, starred: %t", 
+	logger.Infof("Star event: message %s in chat %s, starred: %t",
 		evt.MessageID, evt.ChatJID.String(), evt.Action.GetStarred())
-	
+
 	// Update message starred status in database
 	err := messageStore.UpdateMessageStarredStatus(evt.MessageID, evt.ChatJID.String(), evt.Action.GetStarred())
 	if err != nil {
@@ -582,7 +583,7 @@ func (store *MessageStore) GetStarredMessages(limit, offset int) ([]Message, err
 			WHERE m.starred = true 
 			ORDER BY m.timestamp DESC 
 			LIMIT ? OFFSET ?`
-	
+
 	rows, err := store.db.Query(query, limit, offset)
 	if err != nil {
 		return nil, err
@@ -594,13 +595,13 @@ func (store *MessageStore) GetStarredMessages(limit, offset int) ([]Message, err
 		var msg Message
 		var timestamp time.Time
 		var chatJID, chatName sql.NullString
-		
-		err := rows.Scan(&msg.Sender, &msg.Content, &timestamp, &msg.IsFromMe, 
+
+		err := rows.Scan(&msg.Sender, &msg.Content, &timestamp, &msg.IsFromMe,
 			&msg.MediaType, &msg.Filename, &msg.Starred, &chatJID, &chatName)
 		if err != nil {
 			return nil, err
 		}
-		
+
 		msg.Time = timestamp
 		// Store chat info in the message for context
 		if chatJID.Valid {
@@ -609,7 +610,7 @@ func (store *MessageStore) GetStarredMessages(limit, offset int) ([]Message, err
 		if chatName.Valid {
 			msg.ChatName = chatName.String
 		}
-		
+
 		messages = append(messages, msg)
 	}
 
@@ -1083,7 +1084,7 @@ func main() {
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
-			
+
 		case *events.Star:
 			// Process star/unstar events
 			handleStarEvent(client, messageStore, v, logger)
