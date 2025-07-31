@@ -833,19 +833,19 @@ def list_starred_messages(limit: int = 20, page: int = 0) -> str:
                         content=msg_data['Content'],
                         is_from_me=msg_data['IsFromMe'],
                         chat_jid=msg_data['ChatJID'],
-                        id='',  # Not needed for display
+                        id=msg_data.get('ID', ''),  # Include message ID
                         chat_name=msg_data.get('ChatName', 'Unknown Chat'),
                         media_type=msg_data.get('MediaType'),
                         starred=msg_data.get('Starred', True)
                     )
                     
-                    # Format with chat context
+                    # Format with chat context and message ID
                     chat_indicator = f"[{message.chat_name}]" if message.chat_name else f"[{message.chat_jid}]"
                     sender_name = "Me" if message.is_from_me else message.sender
                     media_info = f" [{message.media_type}]" if message.media_type else ""
                     
                     output += f"⭐ {chat_indicator} {sender_name}: {message.content}{media_info}\n"
-                    output += f"   {message.timestamp.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                    output += f"   {message.timestamp.strftime('%Y-%m-%d %H:%M:%S')} | ChatJID: {message.chat_jid} | MessageID: {message.id}\n\n"
                 
                 return output
             else:

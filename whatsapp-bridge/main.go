@@ -35,6 +35,7 @@ import (
 
 // Message represents a chat message for our client
 type Message struct {
+	ID        string
 	Time      time.Time
 	Sender    string
 	Content   string
@@ -577,7 +578,7 @@ func (store *MessageStore) UpdateMessageStarredStatus(id, chatJID string, starre
 
 // GetStarredMessages returns ALL starred messages across all chats with pagination
 func (store *MessageStore) GetStarredMessages(limit, offset int) ([]Message, error) {
-	query := `SELECT m.sender, m.content, m.timestamp, m.is_from_me, m.media_type, m.filename, m.starred, m.chat_jid, c.name as chat_name
+	query := `SELECT m.id, m.sender, m.content, m.timestamp, m.is_from_me, m.media_type, m.filename, m.starred, m.chat_jid, c.name as chat_name
 			FROM messages m
 			LEFT JOIN chats c ON m.chat_jid = c.jid
 			WHERE m.starred = true 
@@ -596,7 +597,7 @@ func (store *MessageStore) GetStarredMessages(limit, offset int) ([]Message, err
 		var timestamp time.Time
 		var chatJID, chatName sql.NullString
 
-		err := rows.Scan(&msg.Sender, &msg.Content, &timestamp, &msg.IsFromMe,
+		err := rows.Scan(&msg.ID, &msg.Sender, &msg.Content, &timestamp, &msg.IsFromMe,
 			&msg.MediaType, &msg.Filename, &msg.Starred, &chatJID, &chatName)
 		if err != nil {
 			return nil, err
@@ -919,13 +920,32 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
-		// For now, we'll assume the sender is the same as chat for 1-on-1 messages
-		// For group messages, this might need more logic to determine the actual sender
-		senderJID := chatJID
-		isFromMe := false // This should be determined from the original message
+		// Query the database to get the original message details
+		var originalSender string
+		var originalIsFromMe bool
+		err = messageStore.db.QueryRow(
+			"SELECT sender, is_from_me FROM messages WHERE id = ? AND chat_jid = ?",
+			req.MessageID, req.ChatJID,
+		).Scan(&originalSender, &originalIsFromMe)
 
-		// Send star action to WhatsApp
-		err = sendStarAction(client, chatJID, senderJID, req.MessageID, isFromMe, req.Starred)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Message not found: %s", err.Error()), http.StatusNotFound)
+			return
+		}
+
+		// Parse the sender JID
+		senderJID, err := types.ParseJID(originalSender + "@s.whatsapp.net")
+		if err != nil {
+			// If parsing fails, try the original sender as-is (might already be a full JID)
+			senderJID, err = types.ParseJID(originalSender)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("Invalid sender JID: %s", err.Error()), http.StatusBadRequest)
+				return
+			}
+		}
+
+		// Send star action to WhatsApp with correct sender and isFromMe
+		err = sendStarAction(client, chatJID, senderJID, req.MessageID, originalIsFromMe, req.Starred)
 
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
